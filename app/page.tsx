@@ -1,63 +1,59 @@
 "use client";
 
-import "cropperjs/dist/cropper.css";
-import { useState, useRef } from "react";
-import * as exifr from "exifr";
-import Cropper from "cropperjs";
+import { useRef, useState } from "react";
 
-// ---------------- Types ----------------
-type Parsed = {
-  merchant: string;
-  date: string;         // YYYY-MM-DD preferred
-  total: string;
-  vat_amount: string;
-  file_b64: string;
-  file_name: string;
-  file_type: string;
-  raw_text?: string;
-  error?: string;
-};
+// ---------- Types & Supplier Memory ----------
+type SubmitType = "expense" | "bill";
+type MerchantRecord = { canonical: string; submitType: SubmitType };
+type MerchantMap = Record<string, MerchantRecord>;
 
-// --------------- Image helpers ---------------
-
-// Convert HEIC -> JPEG (dynamic import to avoid SSR "window" errors)
-async function convertHEIC(file: File): Promise<File> {
-  if (!file.name.toLowerCase().endsWith(".heic")) return file;
-  const { default: heic2any } = await import("heic2any");
-  const blob = (await heic2any({
-    blob: file,
-    toType: "image/jpeg",
-    quality: 0.92,
-  })) as Blob;
-  return new File([blob], file.name.replace(/\.heic$/i, ".jpg"), {
-    type: "image/jpeg",
-  });
+function loadMerchantMap(): MerchantMap {
+  try {
+    return JSON.parse(localStorage.getItem("merchantMap") || "{}") as MerchantMap;
+  } catch {
+    return {} as MerchantMap;
+  }
+}
+function saveMerchantMap(map: MerchantMap) {
+  localStorage.setItem("merchantMap", JSON.stringify(map));
+}
+function normKey(name: string) {
+  return (name || "").toLowerCase().replace(/\s+/g, " ").trim();
 }
 
-// Auto-rotate based on EXIF Orientation
-async function fixOrientation(file: File): Promise<File> {
+// ---------- Image helpers (client-side) ----------
+async function convertIfHeic(file: File): Promise<File> {
+  const ext = file.name.toLowerCase();
+  if (ext.endsWith(".heic") || ext.endsWith(".heif")) {
+    const { default: heic2any } = await import("heic2any");
+    const blob = (await heic2any({ blob: file, toType: "image/jpeg", quality: 0.92 })) as Blob;
+    return new File([blob], file.name.replace(/\.(heic|heif)$/i, ".jpg"), { type: "image/jpeg" });
+  }
+  return file;
+}
+
+async function autoRotate(file: File): Promise<File> {
   try {
-    const meta = await exifr.parse(file, { translateValues: false, tiff: true });
-    const o = (meta as any)?.Orientation;
-    if (!o || o === 1) return file;
+    const { parse } = await import("exifr");
+    const meta: any = await parse(file, { translateValues: false, tiff: true });
+    const orientation = meta?.Orientation;
+    if (!orientation || orientation === 1) return file;
 
     const img = await createImageBitmap(file);
     let angle = 0;
-    if (o === 6) angle = 90;
-    if (o === 8) angle = -90;
-    if (o === 3) angle = 180;
+    if (orientation === 6) angle = 90;
+    if (orientation === 8) angle = -90;
+    if (orientation === 3) angle = 180;
 
     const rad = (angle * Math.PI) / 180;
     const sin = Math.abs(Math.sin(rad));
     const cos = Math.abs(Math.cos(rad));
-    const w = img.width;
-    const h = img.height;
+    const w = img.width, h = img.height;
     const rw = Math.round(w * cos + h * sin);
     const rh = Math.round(w * sin + h * cos);
 
     const canvas = document.createElement("canvas");
-    canvas.width = rw;
-    canvas.height = rh;
+    canvas.width = rw; canvas.height = rh;
     const ctx = canvas.getContext("2d")!;
     ctx.translate(rw / 2, rh / 2);
     ctx.rotate(rad);
@@ -66,24 +62,15 @@ async function fixOrientation(file: File): Promise<File> {
     const blob: Blob = await new Promise((res) =>
       canvas.toBlob((b) => res(b!), "image/jpeg", 0.92)
     );
-
-    return new File([blob], file.name.replace(/\.[^.]+$/, ".jpg"), {
-      type: "image/jpeg",
-    });
+    return new File([blob], file.name.replace(/\.[^.]+$/, ".jpg"), { type: "image/jpeg" });
   } catch {
     return file;
   }
 }
 
-// Downscale large photos to speed up preview + OCR
-async function downscaleImage(
-  file: File,
-  maxDim = 2000,
-  quality = 0.92
-): Promise<File> {
+async function downscale(file: File, maxDim = 2000, quality = 0.92): Promise<File> {
   const bmp = await createImageBitmap(file);
   let { width, height } = bmp;
-
   if (Math.max(width, height) <= maxDim) return file;
 
   const scale = maxDim / Math.max(width, height);
@@ -91,135 +78,159 @@ async function downscaleImage(
   height = Math.round(height * scale);
 
   const canvas = document.createElement("canvas");
-  canvas.width = width;
-  canvas.height = height;
+  canvas.width = width; canvas.height = height;
   const ctx = canvas.getContext("2d")!;
   ctx.drawImage(bmp, 0, 0, width, height);
 
   const blob: Blob = await new Promise((res) =>
     canvas.toBlob((b) => res(b!), "image/jpeg", quality)
   );
-  return new File([blob], file.name.replace(/\.[^.]+$/, ".jpg"), {
-    type: "image/jpeg",
-  });
+  return new File([blob], file.name.replace(/\.[^.]+$/, ".jpg"), { type: "image/jpeg" });
 }
 
-// ---------------- Page ----------------
+// ---------- Page ----------
 export default function Page() {
-  // upload / analyze state
+  // File & preview
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [file, setFile] = useState<File | null>(null);
-  const [imageURL, setImageURL] = useState<string | null>(null);
-  const [parsed, setParsed] = useState<Parsed | null>(null);
+  const [previewURL, setPreviewURL] = useState<string | null>(null);
+
+  // Analyze result
+  const [parsed, setParsed] = useState<any>(null);
   const [loading, setLoading] = useState(false);
 
-  // review fields
+  // Review fields
   const [merchant, setMerchant] = useState("");
-  const [date, setDate] = useState("");   // YYYY-MM-DD for <input type="date">
+  const [date, setDate] = useState("");
   const [total, setTotal] = useState("");
   const [vat, setVat] = useState("");
 
-  // bill vs expense selection
-  const [submitType, setSubmitType] = useState<"bill" | "expense">("bill");
+  // Save type
+  const [submitType, setSubmitType] = useState<SubmitType>("expense");
 
-  // manual crop
-  const cropRef = useRef<HTMLImageElement>(null);
-  const cropperRef = useRef<Cropper | null>(null);
-  const [manualCrop, setManualCrop] = useState(false);
+  // Supplier memory suggestion
+  const [showSuggest, setShowSuggest] = useState(false);
+  const [suggestedName, setSuggestedName] = useState("");
+  const [suggestedType, setSuggestedType] = useState<SubmitType | undefined>(undefined);
+  const [lastDetectedKey, setLastDetectedKey] = useState("");
 
-  // ------------- Handlers -------------
-
-  // Upload flow -> HEIC convert -> auto-rotate -> downscale
+  // ----- Handlers -----
   async function onFileChange(e: React.ChangeEvent<HTMLInputElement>) {
     const f = e.target.files?.[0];
     if (!f) return;
 
     setLoading(true);
+    setParsed(null);
+    setShowSuggest(false);
+    setMerchant(""); setDate(""); setTotal(""); setVat("");
+
     try {
-      let processed = await convertHEIC(f);
-      processed = await fixOrientation(processed);
-      processed = await downscaleImage(processed, 2000, 0.92);
+      // Prepare image for Textract (JPEG, rotated, (optionally) smaller)
+      let processed = await convertIfHeic(f);
+      processed = await autoRotate(processed);
+      processed = await downscale(processed, 2000, 0.9);
 
       setFile(processed);
-      setImageURL(URL.createObjectURL(processed));
-      setParsed(null);
+      setPreviewURL(URL.createObjectURL(processed));
+    } catch (err: any) {
+      alert("Failed to prepare image: " + (err?.message || String(err)));
+      setFile(null);
+      setPreviewURL(null);
     } finally {
       setLoading(false);
     }
   }
 
-  // Manual crop flow
-  function startManualCrop() {
-    setManualCrop(true);
-    setTimeout(() => {
-      cropperRef.current = new Cropper(cropRef.current!, {
-        viewMode: 1,
-        autoCropArea: 1,
-        movable: true,
-        zoomable: true,
-        responsive: true,
-      });
-    }, 50);
-  }
-
-  async function applyCrop() {
-    if (!cropperRef.current) return;
-    const canvas = cropperRef.current.getCroppedCanvas({ imageSmoothingEnabled: true });
-    if (!canvas) return;
-
-    const blob: Blob = await new Promise((res) =>
-      canvas.toBlob((b) => res(b!), "image/jpeg", 0.92)
-    );
-    const newFile = new File([blob], "receipt.jpg", { type: "image/jpeg" });
-    setFile(newFile);
-    setImageURL(URL.createObjectURL(newFile));
-    setManualCrop(false);
-  }
-
-  // Analyze via AWS Textract route
   async function analyze() {
-    if (!file) return;
+    if (!file) {
+      alert("Please select a receipt image first.");
+      return;
+    }
     setLoading(true);
     try {
       const fd = new FormData();
-      fd.append("file", file);
-
+      fd.append("file", file); // send processed JPEG/PNG
       const res = await fetch("/api/analyze", { method: "POST", body: fd });
       const data = await res.json();
-
       if (data.error) {
         alert("Analyze error: " + data.error);
         return;
       }
 
       setParsed(data);
-      setMerchant(data.merchant || "");
+      const ocrMerchant = (data.merchant || "").trim();
       setDate(data.date || "");
       setTotal(data.total || "");
-      setVat(data.vat_amount || "");
+      setVat(data.vat_amount || ""); // we'll send as `vat` later
+
+      if (ocrMerchant) {
+        const mem = loadMerchantMap();
+        const key = normKey(ocrMerchant);
+        setLastDetectedKey(key);
+        const rec = mem[key];
+
+        if (rec) {
+          const sameName = normKey(rec.canonical) === normKey(ocrMerchant);
+          const sameType = (rec.submitType ?? submitType) === submitType;
+
+          setSuggestedName(rec.canonical);
+          setSuggestedType(rec.submitType);
+          setShowSuggest(!(sameName && sameType)); // show only if different
+
+          // keep detected text until user decides
+          setMerchant(ocrMerchant);
+        } else {
+          setMerchant(ocrMerchant);
+          setShowSuggest(false);
+        }
+      } else {
+        setMerchant("");
+        setShowSuggest(false);
+      }
     } finally {
       setLoading(false);
     }
   }
 
-  // Submit to FreeAgent (Bill or Expense)
+  function useSuggested() {
+    setMerchant(suggestedName);
+    if (suggestedType) setSubmitType(suggestedType);
+    setShowSuggest(false);
+  }
+  function keepDetected() {
+    setShowSuggest(false);
+  }
+
+  function rememberSupplier() {
+    if (!merchant) return;
+    const mem = loadMerchantMap();
+    const key = lastDetectedKey || normKey(merchant);
+    mem[key] = { canonical: merchant, submitType };
+    saveMerchantMap(mem);
+    alert(`Saved supplier: ${merchant} (${submitType})`);
+  }
+
   async function sendToFreeAgent() {
     if (!parsed) return;
+
     const endpoint = submitType === "expense" ? "/api/fa-expense-upload" : "/api/fa-bill-upload";
+    const payload = {
+      merchant,
+      date: date || new Date().toISOString().slice(0, 10),
+      total,
+      vat, // your routes expect `vat`
+      file_b64: parsed.file_b64,
+      file_name: parsed.file_name,
+      file_type: parsed.file_type,
+    };
 
     const res = await fetch(endpoint, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        merchant,
-        date,
-        total,
-        vat,
-        file_b64: parsed.file_b64,
-        file_name: parsed.file_name,
-        file_type: parsed.file_type,
-      }),
+      body: JSON.stringify(payload),
     });
     const data = await res.json();
+
     if (data.success) {
       alert(
         submitType === "expense"
@@ -227,108 +238,133 @@ export default function Page() {
           : "✅ Bill created and receipt attached."
       );
     } else {
-      alert(
-        `⚠️ FreeAgent error: ${(data.error || "unknown")}\n${(data.details || "").slice(0, 400)}`
-      );
+      alert(`⚠️ FreeAgent error: ${(data.error || "unknown")}\n${(data.details || "").slice(0, 400)}`);
       console.log("FA upload error:", data);
     }
   }
 
-  // ------------- UI -------------
-
+  // ---------- UI ----------
   return (
-    <div style={{ maxWidth: 700, margin: "2rem auto", padding: "1rem" }}>
-      <h1>Receipt → Review</h1>
+    <>
+      <div className="container">
+        <h1 style={{ margin: "12px 0 8px" }}>Receipt → Review</h1>
 
-      {/* Upload / Preview */}
-      {!parsed && !manualCrop && (
-        <>
-          <input type="file" accept="image/*" onChange={onFileChange} />
-          {imageURL && (
-            <>
+        {!parsed && (
+          <>
+            {/* Hidden input + camera/library triggers */}
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/*,.heic,.heif,.jpg,.jpeg,.png,.pdf"
+              capture="environment"       // rear camera hint on iPhone
+              onChange={onFileChange}
+              style={{ display: "none" }}
+            />
+
+            <div className="row" style={{ marginTop: 8 }}>
+              <button className="btn" onClick={() => fileInputRef.current?.click()}>📷 Take photo</button>
+              <button className="btn secondary" onClick={() => fileInputRef.current?.click()}>
+                Upload from library
+              </button>
+            </div>
+
+            {previewURL && (
               <img
-                src={imageURL}
-                style={{ maxWidth: "100%", marginTop: "1rem" }}
-                alt="receipt preview"
+                src={previewURL}
+                alt="preview"
+                style={{ width: "100%", marginTop: 12, borderRadius: 12 }}
               />
-              <div style={{ marginTop: "0.5rem" }}>
-                <button onClick={startManualCrop} disabled={!file || loading}>
-                  Adjust Crop
-                </button>
-              </div>
-            </>
-          )}
-          <div style={{ marginTop: "0.75rem" }}>
-            <button onClick={analyze} disabled={!file || loading}>
-              {loading ? "Analyzing..." : "Analyze"}
-            </button>
-          </div>
-        </>
-      )}
+            )}
 
-      {/* Manual Crop Overlay */}
-      {manualCrop && (
-        <div>
-          <h3>Adjust Crop</h3>
-          <img ref={cropRef} src={imageURL!} style={{ maxWidth: "100%" }} />
-          <div style={{ marginTop: "0.5rem" }}>
-            <button onClick={applyCrop}>Apply Crop</button>
-            <button onClick={() => setManualCrop(false)} style={{ marginLeft: 8 }}>
-              Cancel
-            </button>
-          </div>
+            <div style={{ marginTop: 12 }}>
+              <button className="btn" onClick={analyze} disabled={!file || loading}>
+                {loading ? "Analyzing..." : "Analyze receipt"}
+              </button>
+            </div>
+          </>
+        )}
+
+        {parsed && (
+          <>
+            {/* Suggestion banner (only if different) */}
+            {showSuggest && (
+              <div
+                style={{
+                  background: "#f1f5ff",
+                  border: "1px solid #cfe0ff",
+                  padding: 12,
+                  borderRadius: 10,
+                  marginBottom: 12,
+                }}
+              >
+                <div style={{ fontWeight: 600, marginBottom: 6 }}>Use saved supplier name?</div>
+                <div>Detected: <b>{merchant || "(unknown)"}</b></div>
+                <div>
+                  Saved as: <b>{suggestedName}</b>
+                  {suggestedType ? ` · preferred: ${suggestedType}` : ""}
+                </div>
+                <div className="row" style={{ marginTop: 8 }}>
+                  <button className="btn" onClick={useSuggested}>Use “{suggestedName}”</button>
+                  <button className="btn secondary" onClick={keepDetected}>Keep detected</button>
+                </div>
+              </div>
+            )}
+
+            {/* Fields */}
+            <label className="field">Merchant</label>
+            <input type="text" value={merchant} onChange={(e) => setMerchant(e.target.value)} />
+
+            <label className="field">Date</label>
+            <input type="date" value={date} onChange={(e) => setDate(e.target.value)} />
+
+            <label className="field">Total</label>
+            <input type="text" inputMode="decimal" value={total} onChange={(e) => setTotal(e.target.value)} />
+
+            <label className="field">VAT</label>
+            <input type="text" inputMode="decimal" value={vat} onChange={(e) => setVat(e.target.value)} />
+
+            {/* Save type */}
+            <div className="field">
+              <label style={{ marginRight: 16 }}>
+                <input
+                  type="radio"
+                  name="submitType"
+                  checked={submitType === "expense"}
+                  onChange={() => setSubmitType("expense")}
+                />{" "}
+                Paid personally (Expense)
+              </label>
+              <label style={{ marginLeft: 16 }}>
+                <input
+                  type="radio"
+                  name="submitType"
+                  checked={submitType === "bill"}
+                  onChange={() => setSubmitType("bill")}
+                />{" "}
+                Business card (Bill)
+              </label>
+            </div>
+
+            <div className="row" style={{ marginTop: 8 }}>
+              <button className="btn secondary" onClick={rememberSupplier}>Remember this supplier</button>
+            </div>
+
+            {/* Show analyzed image from API */}
+            <img
+              src={`data:${parsed.file_type};base64,${parsed.file_b64}`}
+              alt="analyzed"
+              style={{ width: "100%", marginTop: 16, borderRadius: 12 }}
+            />
+          </>
+        )}
+      </div>
+
+      {/* Sticky bottom bar (only when review is visible) */}
+      {parsed && (
+        <div className="sticky-bar">
+          <button className="btn" onClick={sendToFreeAgent}>Save to FreeAgent</button>
         </div>
       )}
-
-      {/* Review & Edit */}
-      {parsed && (
-        <>
-          <img
-            src={`data:${parsed.file_type};base64,${parsed.file_b64}`}
-            style={{ maxWidth: "100%", margin: "1rem 0" }}
-            alt="receipt"
-          />
-
-          <label>Merchant</label>
-          <input value={merchant} onChange={(e) => setMerchant(e.target.value)} />
-
-          <label style={{ marginTop: 8 }}>Date</label>
-          <input type="date" value={date} onChange={(e) => setDate(e.target.value)} />
-
-          <label style={{ marginTop: 8 }}>Total</label>
-          <input value={total} onChange={(e) => setTotal(e.target.value)} />
-
-          <label style={{ marginTop: 8 }}>VAT</label>
-          <input value={vat} onChange={(e) => setVat(e.target.value)} />
-
-          {/* Bill vs Expense */}
-          <div style={{ marginTop: 12 }}>
-            <label style={{ marginRight: 12 }}>
-              <input
-                type="radio"
-                name="submitType"
-                checked={submitType === "bill"}
-                onChange={() => setSubmitType("bill")}
-              />{" "}
-              Business card (Bill)
-            </label>
-            <label>
-              <input
-                type="radio"
-                name="submitType"
-                checked={submitType === "expense"}
-                onChange={() => setSubmitType("expense")}
-                style={{ marginLeft: 16 }}
-              />{" "}
-              Paid personally (Expense)
-            </label>
-          </div>
-
-          <div style={{ marginTop: 12 }}>
-            <button onClick={sendToFreeAgent}>Send to FreeAgent</button>
-          </div>
-        </>
-      )}
-    </div>
+    </>
   );
 }
