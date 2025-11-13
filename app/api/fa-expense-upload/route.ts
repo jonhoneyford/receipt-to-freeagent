@@ -4,7 +4,9 @@ export const runtime = "nodejs";
 
 function tokenHost() {
   const base = process.env.FREEAGENT_BASE_URL || "https://api.freeagent.com/v2";
-  return base.includes("sandbox") ? "https://api.sandbox.freeagent.com" : "https://api.freeagent.com";
+  return base.includes("sandbox")
+    ? "https://api.sandbox.freeagent.com"
+    : "https://api.freeagent.com";
 }
 
 async function refreshAccessToken() {
@@ -14,68 +16,135 @@ async function refreshAccessToken() {
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
       grant_type: "refresh_token",
-      client_id: process.env.FREEAGENT_CLIENT_ID!,
-      client_secret: process.env.FREEAGENT_CLIENT_SECRET!,
-      refresh_token: process.env.FREEAGENT_REFRESH_TOKEN!,
+      refresh_token: process.env.FREEAGENT_REFRESH_TOKEN || "",
+      client_id: process.env.FREEAGENT_CLIENT_ID || "",
+      client_secret: process.env.FREEAGENT_CLIENT_SECRET || "",
     }),
   });
-  const data = await res.json();
-  if (!res.ok || !data.access_token) throw new Error(`Failed to refresh FreeAgent token: ${res.status}`);
-  process.env.FREEAGENT_ACCESS_TOKEN = data.access_token;
-  return data.access_token as string;
+
+  if (!res.ok) {
+    const text = await res.text();
+    console.error("FreeAgent token refresh failed:", res.status, text);
+    throw new Error("Failed to refresh FreeAgent access token");
+  }
+
+  const json = await res.json();
+  const newAccess = json.access_token as string | undefined;
+  const newRefresh = json.refresh_token as string | undefined;
+
+  if (newAccess) {
+    process.env.FREEAGENT_ACCESS_TOKEN = newAccess;
+  }
+  if (newRefresh) {
+    process.env.FREEAGENT_REFRESH_TOKEN = newRefresh;
+  }
+
+  return newAccess;
 }
 
-async function withToken(fn: (t: string) => Promise<Response>): Promise<[Response, string, string]> {
-  let t = process.env.FREEAGENT_ACCESS_TOKEN!;
-  let r = await fn(t);
-  let txt = await r.text();
-  if (r.status === 401) {
-    t = await refreshAccessToken();
-    r = await fn(t);
-    txt = await r.text();
+async function withToken<T>(
+  fn: (token: string) => Promise<Response>
+): Promise<[Response, string, string]> {
+  let token = process.env.FREEAGENT_ACCESS_TOKEN || "";
+  let res = await fn(token);
+  let text = await res.text();
+
+  // Retry once on 401 with refreshed token
+  if (res.status === 401) {
+    token = (await refreshAccessToken()) || "";
+    res = await fn(token);
+    text = await res.text();
   }
-  return [r, txt, t];
+
+  return [res, text, token];
 }
 
 export async function POST(req: NextRequest) {
   try {
-    const { merchant, date, total, vat, file_b64, file_name, file_type } = await req.json();
+    const { merchant, date, total, vat, file_b64, file_name, file_type } =
+      await req.json();
 
-    if (!total)   return NextResponse.json({ error: "Missing total" }, { status: 400 });
-    if (!file_b64) return NextResponse.json({ error: "Missing file_b64" }, { status: 400 });
+    if (!total) {
+      return NextResponse.json(
+        { error: "Missing total" },
+        { status: 400 }
+      );
+    }
+    if (!file_b64) {
+      return NextResponse.json(
+        { error: "Missing file data" },
+        { status: 400 }
+      );
+    }
 
     const base = process.env.FREEAGENT_BASE_URL || "https://api.freeagent.com/v2";
-    const UA = process.env.FREEAGENT_USER_AGENT || "Receipt OCR Uploader (you@example.com)";
+    const UA =
+      process.env.FREEAGENT_USER_AGENT ||
+      "ReceiptUploader (receipt-to-freeagent)";
 
-    // --- me ---
+    // --- 1) Fetch current user (for expense.user) ---
     const [uRes, uText] = await withToken((t) =>
-      fetch(`${base}/users/me`, { headers: { Authorization: `Bearer ${t}`, Accept: "application/json" , "User-Agent": UA } })
+      fetch(`${base}/users/me`, {
+        headers: {
+          Authorization: `Bearer ${t}`,
+          Accept: "application/json",
+          "User-Agent": UA,
+        },
+      })
     );
-    if (!uRes.ok) return NextResponse.json({ error: "Fetch current user failed", details: uText }, { status: 500 });
-    const me = JSON.parse(uText || "{}")?.user;
-    const userUrl: string | undefined = me?.url;
-    if (!userUrl) return NextResponse.json({ error: "No user URL returned" }, { status: 500 });
 
-    // --- expense create ---
+    if (!uRes.ok) {
+      return NextResponse.json(
+        { error: "User lookup failed", details: uText },
+        { status: 500 }
+      );
+    }
+
+    const uJson = JSON.parse(uText || "{}");
+    const userUrl = uJson.user?.url;
+    if (!userUrl) {
+      return NextResponse.json(
+        { error: "No user URL in response" },
+        { status: 500 }
+      );
+    }
+
+    // --- 2) Normalise dates & amounts ---
     const today = new Date().toISOString().slice(0, 10);
-    const dated_on = (date && /^\d{4}-\d{2}-\d{2}$/.test(date)) ? date : today;
-    const gross = Number(String(total).replace(/[^\d.-]/g, ""));
-    const vatNum = vat ? Number(String(vat).replace(/[^\d.-]/g, "")) : undefined;
+    const dated_on =
+      date && /^\d{4}-\d{2}-\d{2}$/.test(date) ? date : today;
 
+    // Parse strings, then force positive values (normal receipts)
+    const grossRaw = Number(
+      String(total).replace(/[^\d.-]/g, "")
+    );
+    const vatRaw = vat
+      ? Number(String(vat).replace(/[^\d.-]/g, ""))
+      : undefined;
+
+    const gross = Math.abs(grossRaw);
+    const vatNum =
+      typeof vatRaw === "number" && !Number.isNaN(vatRaw)
+        ? Math.abs(vatRaw)
+        : undefined;
+
+    // --- 3) Build Expense payload ---
     const expenseBody: any = {
       expense: {
         user: userUrl,
         dated_on,
         description: merchant || "Receipt",
-        category: "/categories/280",
-        gross_value: gross,
+        // Category: adjust this if you prefer a different default
+        category: "/categories/280", // General Purchases (example)
+        gross_value: gross,          // ✅ always positive
       },
     };
+
     if (typeof vatNum === "number" && !Number.isNaN(vatNum)) {
-      expenseBody.expense.sales_tax_value = vatNum;
+      expenseBody.expense.sales_tax_value = vatNum; // ✅ always positive
     }
 
-    const [eRes, eText] = await withToken((t) =>
+    const [eRes, eText, token] = await withToken((t) =>
       fetch(`${base}/expenses`, {
         method: "POST",
         headers: {
@@ -87,29 +156,37 @@ export async function POST(req: NextRequest) {
         body: JSON.stringify(expenseBody),
       })
     );
-    if (!eRes.ok) return NextResponse.json({ error: "Create expense failed", details: eText }, { status: 500 });
+
+    if (!eRes.ok) {
+      return NextResponse.json(
+        { error: "Create expense failed", details: eText },
+        { status: 500 }
+      );
+    }
+
     const eJson = JSON.parse(eText || "{}");
-    const expenseUrl: string | undefined = eJson.expense?.url;
-    if (!expenseUrl) return NextResponse.json({ error: "No expense URL returned" }, { status: 500 });
+    const expenseUrl = eJson.expense?.url;
 
-    // --- attach via PUT .../expenses/:id with attachment object ---
-const filename =
-  file_name ||
-  `${dated_on}_${(merchant || "receipt").replace(/[^\w\- ]+/g, "").slice(0, 50)}_${gross.toFixed(2)}.jpg`;
+    if (!expenseUrl) {
+      return NextResponse.json(
+        { error: "Expense created but no URL returned" },
+        { status: 500 }
+      );
+    }
 
+    // --- 4) Upload attachment & link to the expense ---
     const attachBody = {
-      expense: {
-        attachment: {
-          data: file_b64,
-          content_type: file_type || "image/jpeg",
-          file_name: filename,
-        },
+      attachment: {
+        file_name: file_name || "receipt.jpg",
+        content_type: file_type || "image/jpeg",
+        file: file_b64,
+        attached_to: expenseUrl,
       },
     };
 
     const [aRes, aText] = await withToken((t) =>
-      fetch(expenseUrl, {
-        method: "PUT",
+      fetch(`${base}/attachments`, {
+        method: "POST",
         headers: {
           Authorization: `Bearer ${t}`,
           Accept: "application/json",
@@ -119,11 +196,25 @@ const filename =
         body: JSON.stringify(attachBody),
       })
     );
-    if (!aRes.ok) return NextResponse.json({ error: "Attach file failed", details: aText }, { status: 500 });
+
+    if (!aRes.ok) {
+      return NextResponse.json(
+        { error: "Attach file failed", details: aText },
+        { status: 500 }
+      );
+    }
 
     const aJson = JSON.parse(aText || "{}");
-    return NextResponse.json({ success: true, expense: aJson.expense || eJson.expense });
+
+    return NextResponse.json({
+      success: true,
+      expense: eJson.expense,
+      attachment: aJson.attachment ?? aJson,
+    });
   } catch (e: any) {
-    return NextResponse.json({ error: e?.message || "fa-expense-upload failed" }, { status: 500 });
+    return NextResponse.json(
+      { error: e?.message || "fa-expense-upload failed" },
+      { status: 500 }
+    );
   }
 }
