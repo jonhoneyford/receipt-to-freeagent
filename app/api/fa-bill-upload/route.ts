@@ -24,7 +24,7 @@ async function refreshAccessToken() {
 
   if (!res.ok) {
     const text = await res.text();
-    console.error("FreeAgent token refresh failed:", res.status, text);
+    console.error("FreeAgent token refresh failed (bill):", res.status, text);
     throw new Error("Failed to refresh FreeAgent access token");
   }
 
@@ -32,23 +32,20 @@ async function refreshAccessToken() {
   const newAccess = json.access_token as string | undefined;
   const newRefresh = json.refresh_token as string | undefined;
 
-  if (newAccess) {
-    process.env.FREEAGENT_ACCESS_TOKEN = newAccess;
-  }
-  if (newRefresh) {
-    process.env.FREEAGENT_REFRESH_TOKEN = newRefresh;
-  }
+  if (newAccess) process.env.FREEAGENT_ACCESS_TOKEN = newAccess;
+  if (newRefresh) process.env.FREEAGENT_REFRESH_TOKEN = newRefresh;
 
   return newAccess;
 }
 
-async function withToken<T>(
+async function withToken(
   fn: (token: string) => Promise<Response>
 ): Promise<[Response, string, string]> {
   let token = process.env.FREEAGENT_ACCESS_TOKEN || "";
   let res = await fn(token);
   let text = await res.text();
 
+  // retry once on 401
   if (res.status === 401) {
     token = (await refreshAccessToken()) || "";
     res = await fn(token);
@@ -63,16 +60,18 @@ export async function POST(req: NextRequest) {
     const { merchant, date, total, vat, file_b64, file_name, file_type } =
       await req.json();
 
-    if (!total)
+    if (!total) {
       return NextResponse.json(
         { error: "Missing total" },
         { status: 400 }
       );
-    if (!file_b64)
+    }
+    if (!file_b64) {
       return NextResponse.json(
         { error: "Missing file data" },
         { status: 400 }
       );
+    }
 
     const base = process.env.FREEAGENT_BASE_URL || "https://api.freeagent.com/v2";
     const UA =
@@ -80,8 +79,8 @@ export async function POST(req: NextRequest) {
       "ReceiptUploader (receipt-to-freeagent)";
 
     // --- 1) Look up or create contact ---
-    // For now, we naïvely search by company_name == merchant.
     const searchName = merchant || "Unknown Supplier";
+
     const [cRes, cText] = await withToken((t) =>
       fetch(
         `${base}/contacts?company_name=${encodeURIComponent(searchName)}`,
@@ -109,7 +108,7 @@ export async function POST(req: NextRequest) {
         : null;
 
     if (!contactUrl) {
-      // Create a new contact
+      // create a new contact
       const contactBody = {
         contact: {
           company_name: merchant || "Supplier",
@@ -140,6 +139,7 @@ export async function POST(req: NextRequest) {
 
       const nJson = JSON.parse(nText || "{}");
       contactUrl = nJson.contact?.url;
+
       if (!contactUrl) {
         return NextResponse.json(
           { error: "No contact URL in response" },
@@ -148,13 +148,12 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // --- 2) Normalise amounts & dates ---
+    // --- 2) Normalise dates & amounts ---
     const today = new Date().toISOString().slice(0, 10);
     const dated_on =
       date && /^\d{4}-\d{2}-\d{2}$/.test(date) ? date : today;
     const due_on = dated_on;
 
-    // Parse strings to numbers, then force them positive.
     const grossRaw = Number(
       String(total).replace(/[^\d.-]/g, "")
     );
@@ -168,7 +167,7 @@ export async function POST(req: NextRequest) {
         ? Math.abs(vatRaw)
         : undefined;
 
-    // --- 3) Build Bill payload ---
+    // --- 3) Build Bill payload *with inline attachment* ---
     const billBody: any = {
       bill: {
         contact: contactUrl,
@@ -178,17 +177,23 @@ export async function POST(req: NextRequest) {
         bill_items: [
           {
             category: "/categories/280", // General Purchases
-            total_value: gross, // ✅ Always positive
+            total_value: gross,
           },
         ],
+        attachment: {
+          data: file_b64,
+          file_name: file_name || "receipt.jpg",
+          description: merchant || "Receipt",
+          content_type: file_type || "image/jpeg",
+        },
       },
     };
 
     if (typeof vatNum === "number" && !Number.isNaN(vatNum)) {
-      billBody.bill.bill_items[0].sales_tax_value = vatNum; // ✅ Always positive
+      billBody.bill.bill_items[0].sales_tax_value = vatNum;
     }
 
-    const [bRes, bText, token] = await withToken((t) =>
+    const [bRes, bText] = await withToken((t) =>
       fetch(`${base}/bills`, {
         method: "POST",
         headers: {
@@ -209,54 +214,13 @@ export async function POST(req: NextRequest) {
     }
 
     const bJson = JSON.parse(bText || "{}");
-    const billUrl = bJson.bill?.url;
-
-    if (!billUrl) {
-      return NextResponse.json(
-        { error: "Bill created but no URL returned" },
-        { status: 500 }
-      );
-    }
-
-    // --- 4) Upload attachment & link it to the bill ---
-    const binary = Buffer.from(file_b64, "base64");
-    const attachBody = {
-      attachment: {
-        file_name: file_name || "receipt.jpg",
-        content_type: file_type || "image/jpeg",
-        file: file_b64,
-        // Some FreeAgent APIs allow linking via "attached_to"
-        attached_to: billUrl,
-      },
-    };
-
-    const [aRes, aText] = await withToken((t) =>
-      fetch(`${base}/attachments`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${t}`,
-          Accept: "application/json",
-          "Content-Type": "application/json",
-          "User-Agent": UA,
-        },
-        body: JSON.stringify(attachBody),
-      })
-    );
-
-    if (!aRes.ok) {
-      return NextResponse.json(
-        { error: "Attach file failed", details: aText },
-        { status: 500 }
-      );
-    }
-
-    const aJson = JSON.parse(aText || "{}");
 
     return NextResponse.json({
       success: true,
-      bill: aJson.bill || bJson.bill,
+      bill: bJson.bill,
     });
   } catch (e: any) {
+    console.error("fa-bill-upload failed:", e);
     return NextResponse.json(
       { error: e?.message || "fa-bill-upload failed" },
       { status: 500 }
